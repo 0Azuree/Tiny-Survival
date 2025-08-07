@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Tiny Survival — GitHub Pages Demo</title>
+<style>
+  :root{
+    --ui-bg:#111;
+    --panel:#0f1720;
+    --text:#e6eef6;
+    --accent:#ffd166;
+  }
+  html,body{height:100%;margin:0;background:linear-gradient(#7ec0ff,#9ad0ff 40%, #6fc18c 100%);font-family:monospace;color:var(--text)}
+  #gameUI{position:fixed;left:10px;top:10px;width:360px;padding:10px;background:rgba(2,6,12,0.6);border-radius:8px;backdrop-filter: blur(4px);}
+  canvas{display:block;margin:40px auto;border:6px solid #000;image-rendering:pixelated;background:#6fc18c;}
+  .row{display:flex;gap:8px;align-items:center}
+  .hotbar{display:flex;gap:4px;margin-top:8px}
+  .slot{width:34px;height:34px;background:#0b1220;border:1px solid #2b3642;display:flex;align-items:center;justify-content:center;font-size:12px;color:var(--text)}
+  .selected{outline:2px solid var(--accent);box-shadow:0 0 10px rgba(255,209,102,0.12)}
+  button {background:#132032;color:var(--text);border:1px solid #274156;padding:6px;border-radius:6px;cursor:pointer}
+  #log{height:70px;overflow:auto;margin-top:8px;padding:6px;background:rgba(0,0,0,0.25);border-radius:6px;font-size:12px}
+  #craftPanel{margin-top:8px;padding:6px;background:rgba(0,0,0,0.15);border-radius:6px}
+  #miniMap{position:fixed;right:10px;top:10px;width:160px;height:120px;border-radius:6px;background:rgba(0,0,0,0.35);padding:6px}
+  .stat{font-size:12px;margin-top:4px}
+  a.small{color:var(--accent);font-size:12px}
+  .hint{opacity:0.8;font-size:12px;margin-top:6px}
+</style>
+</head>
+<body>
+
+<div id="gameUI">
+  <div style="font-weight:700">Tiny Survival (Single-file)</div>
+  <div class="row" style="margin-top:6px">
+    <div class="stat">Health: <span id="health">100</span></div>
+    <div class="stat" style="margin-left:12px">Hunger: <span id="hunger">100</span></div>
+    <div style="flex:1"></div>
+    <button id="saveBtn">Save</button>
+    <button id="resetBtn">Reset</button>
+  </div>
+
+  <div class="row" style="margin-top:8px">
+    <div style="flex:1">
+      <div class="hotbar" id="hotbar"></div>
+      <div class="hint">W/A/D to move — Space to jump — Left click to mine/attack — Right click to place — E to open crafting</div>
+    </div>
+  </div>
+
+  <div id="craftPanel" style="display:none">
+    <div style="font-weight:700">Crafting</div>
+    <div id="recipes" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px"></div>
+    <div style="margin-top:8px"><button id="closeCraft">Close</button></div>
+  </div>
+
+  <div id="log"></div>
+</div>
+
+<canvas id="game" width="960" height="480"></canvas>
+
+<div id="miniMap">
+  <div style="font-weight:700">Mini Map</div>
+  <canvas id="mapcan" width="136" height="96" style="image-rendering:pixelated"></canvas>
+  <div style="font-size:12px;margin-top:6px">Day: <span id="day">1</span> — Time: <span id="time">06:00</span></div>
+</div>
+
+<script>
+/*
+  Tiny Survival — single-file HTML + JS game.
+  - Tile-based world
+  - Mining/Placing
+  - Crafting and Crafting Table
+  - Entities: sheep + hostile creatures at night
+  - Health/Hunger/Day-night cycle
+  - Save to localStorage
+  Expandable and designed to be hosted on GitHub Pages.
+*/
+
+/* ----------------------
+   Config & Utilities
+   ---------------------- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const mapCan = document.getElementById('mapcan'), mctx = mapCan.getContext('2d');
+
+const TILE = 16;                // pixel tile size
+const VIEW_W = canvas.width;
+const VIEW_H = canvas.height;
+const T_W = 200;                // world width in tiles
+const T_H = 60;                 // world height in tiles
+
+const GRAVITY = 0.6;
+const playerStartX = Math.floor(T_W/2);
+const DAY_LENGTH = 60 * 1000;  // ms per day (60s)
+
+const logEl = document.getElementById('log');
+function log(s){ logEl.innerText = s + '\\n' + logEl.innerText; }
+
+/* ----------------------
+   Tile system & world gen
+   ---------------------- */
+const Tile = {
+  AIR:0, GRASS:1, DIRT:2, STONE:3, COAL:4, IRON:5, TREE_TRUNK:6, LEAVES:7, CRAFTING:8, ORE_GOLD:9
+};
+
+const tileColor = {
+  [Tile.AIR]:'#00000000',
+  [Tile.GRASS]:'#3cb043',
+  [Tile.DIRT]:'#8b5a2b',
+  [Tile.STONE]:'#6b6b6b',
+  [Tile.COAL]:'#222222',
+  [Tile.IRON]:'#b8b8d0',
+  [Tile.TREE_TRUNK]:'#6b3e26',
+  [Tile.LEAVES]:'#2e8b57',
+  [Tile.CRAFTING]:'#8b4513',
+  [Tile.ORE_GOLD]:'#ffd700'
+};
+
+let world = new Array(T_H);
+for(let y=0;y<T_H;y++){
+  world[y]=new Array(T_W).fill(Tile.AIR);
+}
+
+// Generate simple terrain with caves & ores
+function generateWorld(seed=1){
+  const rng = mulberry32(seed);
+  const surface = [];
+  let base = Math.floor(T_H*0.35);
+  for(let x=0;x<T_W;x++){
+    base += Math.floor((rng() - 0.5) * 1.6);
+    base = Math.max(6, Math.min(T_H-12, base));
+    surface[x]=base;
+  }
+  for(let x=0;x<T_W;x++){
+    for(let y=0;y<T_H;y++){
+      if(y < surface[x]) world[y][x] = Tile.AIR;
+      else if(y === surface[x]) world[y][x] = Tile.GRASS;
+      else if(y < surface[x]+3) world[y][x] = Tile.DIRT;
+      else {
+        // stone layer with caves
+        if(rng() < 0.04) world[y][x] = Tile.COAL;
+        else if(rng() < 0.02) world[y][x] = Tile.IRON;
+        else if(rng() < 0.005) world[y][x] = Tile.ORE_GOLD;
+        else world[y][x] = Tile.STONE;
+        // cave holes
+        if(rng()<0.05 && y>surface[x]+2) world[y][x] = Tile.AIR;
+      }
+    }
+  }
+  // scatter some trees
+  for(let x=2;x<T_W-4;x++){
+    if(rng() < 0.06 && world[surface[x]][x]===Tile.GRASS){
+      // trunk
+      let h = 3 + Math.floor(rng()*3);
+      for(let t=0;t<h;t++) world[surface[x]-1-t][x] = Tile.TREE_TRUNK;
+      // leaves
+      for(let lx=-2;lx<=2;lx++){
+        for(let ly=-2;ly<=1;ly++){
+          if(Math.abs(lx)+Math.abs(ly) < 3 && rng()>0.15) {
+            const ax = x+lx, ay = surface[x]-h+ly;
+            if(ax>0 && ax<T_W && ay>0 && ay<T_H) world[ay][ax]=Tile.LEAVES;
+          }
+        }
+      }
+    }
+  }
+  // place a crafting table near start
+  const px = Math.floor(T_W/2)+3, py = surface[px];
+  world[py][px] = Tile.CRAFTING;
+}
+function mulberry32(a) {
+  return function() {
+    var t = a += 0x6D2B79F5;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  }
+}
+
+/* ----------------------
+   Player / Inventory
+   ---------------------- */
+const player = {
+  x: playerStartX + 0.5,
+  y: 5,
+  vx:0, vy:0,
+  w:0.9, h:1.8,
+  facing:1,
+  onGround:false,
+  health:100, hunger:100,
+  inv: {}, // item => count
+  hotbar: ['stone_pick','wood','dirt','torch','mutton'],
+  selected:0,
+  speed:0.08,
+  jump: -9
+};
+
+function give(item, n=1){
+  player.inv[item]=(player.inv[item]||0)+n;
+}
+function take(item, n=1){
+  if((player.inv[item]||0) < n) return false;
+  player.inv[item]-=n; if(player.inv[item]<=0) delete player.inv[item];
+  return true;
+}
+
+/* ----------------------
+   Items & Recipes
+   ---------------------- */
+const Items = {
+  wood:'wood', plank:'plank', stick:'stick',
+  stone:'stone', coal:'coal', iron:'iron',
+  pick_wood:'wood_pick', pick_stone:'stone_pick', sword_stone:'stone_sword',
+  dirt:'dirt', torch:'torch', crafting_table:'crafting_table',
+  mutton:'mutton', wool:'wool', bread:'bread', apple:'apple'
+};
+
+const recipes = [
+  {id:'plank', to:Items.plank, req:{wood:1}},
+  {id:'stick', to:Items.stick, req:{plank:2}},
+  {id:'wood_pick', to:Items.pick_wood, req:{wood:3, stick:2}},
+  {id:'stone_pick', to:Items.pick_stone, req:{stone:3, stick:2}},
+  {id:'stone_sword', to:Items.sword_stone, req:{stone:2, stick:1}},
+  {id:'crafting_table', to:Items.crafting_table, req:{plank:4}},
+  {id:'torch', to:Items.torch, req:{coal:1, stick:1}},
+  {id:'bread', to:Items.bread, req:{wheat:3}}, // wheat not implemented - placeholder
+];
+
+/* ----------------------
+   Entities (sheep, hostile mobs)
+   ---------------------- */
+let entities = []; // {type,x,y,vx,vy,state,health,...}
+function spawnSheep(x,y){
+  entities.push({type:'sheep',x,y,vx:(Math.random()-0.5)*0.6,vy:0,health:10,age:0});
+}
+function spawnZombie(x,y){
+  entities.push({type:'zombie',x,y,vx:0,vy:0,health:20});
+}
+
+/* ----------------------
+   World interactions (mine/place)
+   ---------------------- */
+function tileAt(tx,ty){ if(tx<0||tx>=T_W||ty<0||ty>=T_H) return Tile.STONE; return world[ty][tx]; }
+function setTile(tx,ty,val){ if(tx<0||tx>=T_W||ty<0||ty>=T_H) return; world[ty][tx]=val; }
+
+function mineTile(tx,ty,tool='hand'){
+  const t = tileAt(tx,ty);
+  if(t===Tile.AIR) return;
+  // breakable types
+  let drops = [];
+  if(t===Tile.GRASS){ drops.push('dirt'); setTile(tx,ty,Tile.DIRT) }
+  else {
+    setTile(tx,ty,Tile.AIR);
+    if(t===Tile.DIRT) drops.push('dirt');
+    if(t===Tile.STONE) drops.push('stone');
+    if(t===Tile.COAL) drops.push('coal');
+    if(t===Tile.IRON) drops.push('iron');
+    if(t===Tile.ORE_GOLD) drops.push('gold');
+    if(t===Tile.TREE_TRUNK) { drops.push('wood'); 
+      // maybe drop leaves into air
+      for(let yy=ty-3;yy<=ty+1;yy++){
+        for(let xx=tx-2;xx<=tx+2;xx++){
+          if(tileAt(xx,yy)===Tile.LEAVES && Math.random()<0.7) setTile(xx,yy,Tile.AIR);
+        }
+      }
+    }
+    if(t===Tile.LEAVES && Math.random()<0.25) drops.push('apple');
+    if(t===Tile.CRAFTING) drops.push('crafting_table');
+  }
+  for(const d of drops) give(d,1);
+  log('Mined: ' + drops.join(', '));
+}
+
+/* ----------------------
+   Input
+   ---------------------- */
+const keys = {};
+window.addEventListener('keydown', e=>{
+  keys[e.key.toLowerCase()]=true;
+  if(e.key===' ') e.preventDefault();
+});
+window.addEventListener('keyup', e=>{ keys[e.key.toLowerCase()]=false; });
+
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('mousedown', (e)=>{
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX-rect.left), my = (e.clientY-rect.top);
+  const worldX = Math.floor((mx + cam.x * TILE)/TILE);
+  const worldY = Math.floor((my + cam.y * TILE)/TILE);
+  if(e.button===0) { // left = mine / attack
+    // distance check
+    if(distance(player.x, player.y, worldX+0.5, worldY+0.5) < 3.5){
+      // attack mobs if close
+      for(let i=entities.length-1;i>=0;i--){
+        const ent = entities[i];
+        if(distance(ent.x, ent.y, worldX+0.5, worldY+0.5) < 1.2){
+          ent.health -= player.hotbar[player.selected]==='stone_sword' ? 8 : 3;
+          if(ent.health <= 0) {
+            if(ent.type==='sheep'){ give('mutton',1); if(Math.random()<0.6) give('wool',1); }
+            if(ent.type==='zombie') give('rot',1);
+            entities.splice(i,1);
+            log('Killed ' + ent.type);
+          } else log('Hit ' + ent.type);
+          return;
+        }
+      }
+      // else mine
+      mineTile(worldX, worldY, player.hotbar[player.selected]);
+    }
+  } else if(e.button===2){ // right = place
+    // place block if inventory has it
+    const selected = player.hotbar[player.selected];
+    if(!selected) return;
+    const placeable = {
+      dirt:Tile.DIRT, wood:Tile.TREE_TRUNK, stone:Tile.STONE, wool:Tile.LEAVES, crafting_table:Tile.CRAFTING
+    };
+    if(placeable[selected]){
+      if(take(selected,1)){
+        setTile(worldX, worldY, placeable[selected]);
+        log('Placed: ' + selected);
+      } else {
+        log('No item to place: ' + selected);
+      }
+    } else log('Cannot place: ' + selected);
+  }
+});
+
+canvas.addEventListener('wheel', (e)=>{
+  e.preventDefault();
+  if(e.deltaY>0) player.selected = (player.selected+1) % player.hotbar.length;
+  else player.selected = (player.selected-1 + player.hotbar.length) % player.hotbar.length;
+});
+
+/* ----------------------
+   Camera
+   ---------------------- */
+const cam = {x:0,y:0};
+function updateCamera(){
+  cam.x = Math.max(0, Math.floor(player.x - VIEW_W/TILE/2));
+  cam.y = Math.max(0, Math.floor(player.y - VIEW_H/TILE/2));
+  cam.x = Math.min(T_W - Math.floor(VIEW_W/TILE), cam.x);
+  cam.y = Math.min(T_H - Math.floor(VIEW_H/TILE), cam.y);
+}
+
+/* ----------------------
+   Game Loop & Rendering
+   ---------------------- */
+let lastTime = performance.now();
+let dayStart = performance.now();
+let dayCount = 1;
+
+function gameTick(now){
+  const dt = Math.min(50, now - lastTime);
+  lastTime = now;
+  // time of day 0..1
+  const tDay = ((now - dayStart) % DAY_LENGTH) / DAY_LENGTH;
+  const hour = Math.floor(tDay*24);
+  const minute = Math.floor(((tDay*24)-hour)*60);
+  document.getElementById('time').innerText = `${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}`;
+  document.getElementById('day').innerText = dayCount;
+  if(now - dayStart >= DAY_LENGTH){ dayCount++; dayStart = now; log('Day ' + dayCount); }
+  const isNight = (hour < 6 || hour >= 18);
+
+  // Player physics & controls
+  // left/right
+  let move = 0;
+  if(keys['a']) move -= 1;
+  if(keys['d']) move += 1;
+  player.vx += move * player.speed * (dt/16);
+  player.vx *= 0.9;
+  // jumps
+  if(keys[' '] && player.onGround){ player.vy = player.jump; player.onGround=false; }
+  // gravity
+  player.vy += GRAVITY * (dt/16);
+  // integrate
+  player.x += player.vx * (dt/16);
+  player.y += player.vy * (dt/16);
+
+  // collision with world (simple AABB tile collision)
+  const left = Math.floor(player.x - player.w/2);
+  const right = Math.floor(player.x + player.w/2);
+  const top = Math.floor(player.y - player.h);
+  const bottom = Math.floor(player.y);
+
+  // vertical collision
+  if(player.vy > 0){
+    // falling, check bottom tiles
+    const by = Math.floor(player.y);
+    let blocked = false;
+    for(let tx=left;tx<=right;tx++){
+      if(tileAt(tx,by) !== Tile.AIR){
+        player.y = by - 0.0001;
+        player.vy = 0;
+        player.onGround = true;
+        blocked = true;
+      }
+    }
+    if(!blocked) player.onGround = false;
+  } else if(player.vy < 0){
+    // hitting head
+    const ty = Math.floor(player.y - player.h);
+    for(let tx=left;tx<=right;tx++){
+      if(tileAt(tx,ty) !== Tile.AIR){
+        player.vy = 0;
+        player.y = ty + player.h + 0.0001;
+      }
+    }
+  }
+  // horizontal collision
+  if(player.vx !== 0){
+    const dir = Math.sign(player.vx);
+    const nx = Math.floor(player.x + dir*(player.w/2));
+    for(let ty=top;ty<=bottom;ty++){
+      if(tileAt(nx,ty) !== Tile.AIR){
+        // block movement
+        player.x -= player.vx * 0.5 * (dt/16);
+        player.vx = 0;
+      }
+    }
+  }
+
+  // hunger, health
+  player.hunger = Math.max(0, player.hunger - 0.001 * dt);
+  if(player.hunger <= 0) player.health = Math.max(0, player.health - 0.02 * dt);
+  if(player.health <= 0){ log('You died. Press Reset to respawn.'); }
+
+  // Entities AI
+  for(let i=entities.length-1;i>=0;i--){
+    const e = entities[i];
+    e.age = (e.age||0) + dt;
+    if(e.type==='sheep'){
+      // simple wander
+      if(Math.random() < 0.01) e.vx = (Math.random()-0.5)*0.8;
+      e.x += e.vx*(dt/16);
+      // gravity
+      e.vy += GRAVITY*(dt/16);
+      e.y += e.vy*(dt/16);
+      // collision ground
+      const by = Math.floor(e.y);
+      if(tileAt(Math.floor(e.x),by)!==Tile.AIR){ e.y = by - 0.01; e.vy=0; }
+      // occasional drop wool
+      if(Math.random() < 0.0008) give('wool',1);
+    }
+    if(e.type==='zombie'){
+      // approach player at night
+      const dx = player.x - e.x;
+      e.vx = Math.sign(dx)*0.02;
+      e.x += e.vx*(dt/16);
+      e.vy += GRAVITY*(dt/16); e.y += e.vy*(dt/16);
+      if(distance(e.x,e.y,player.x,player.y) < 1.2){
+        player.health -= 0.03 * dt;
+      }
+    }
+    // remove if off map (cleanup)
+    if(e.x < 0 || e.x > T_W || e.y > T_H+10) entities.splice(i,1);
+  }
+
+  // spawn logic
+  if(Math.random() < 0.002) { // sheep spawn on surface
+    const sx = Math.floor(player.x + (Math.random()-0.5)*30);
+    let sy = 0;
+    for(let yy=0;yy<T_H;yy++) if(tileAt(sx,yy)!==Tile.AIR){ sy = yy-1; break; }
+    if(sy>2 && tileAt(sx,sy)===Tile.GRASS) spawnSheep(sx+Math.random(), sy);
+  }
+  if(isNight && Math.random() < 0.005) {
+    const zx = Math.floor(player.x + (Math.random()-0.5)*40);
+    let zy = 0;
+    for(let yy=0;yy<T_H;yy++) if(tileAt(zx,yy)!==Tile.AIR){ zy = yy-1; break; }
+    spawnZombie(zx, zy);
+  }
+
+  // craft table interaction if near
+  const playerTileX = Math.floor(player.x);
+  const playerTileY = Math.floor(player.y);
+  if(tileAt(playerTileX, playerTileY) === Tile.CRAFTING) {
+    // prompt open crafting table when E is pressed
+    if(keys['e']) { openCrafting(true); }
+  }
+
+  // Rendering
+  updateCamera();
+  renderWorld(tDay);
+  renderEntities();
+  renderPlayer();
+  renderUI();
+
+  requestAnimationFrame(gameTick);
+}
+
+function distance(ax,ay,bx,by){ return Math.hypot(ax-bx, ay-by); }
+
+function renderWorld(tDay){
+  // clear
+  const dayLight = Math.max(0.2, Math.cos(tDay*2*Math.PI)*0.5+0.5);
+  ctx.fillStyle = '#6fc18c';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // sky overlay for night
+  const skyAlpha = 1 - dayLight;
+  ctx.fillStyle = `rgba(0,0,32,${skyAlpha*0.6})`;
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  const cols = Math.floor(VIEW_W / TILE) + 2;
+  const rows = Math.floor(VIEW_H / TILE) + 2;
+  for(let i=0;i<cols;i++){
+    for(let j=0;j<rows;j++){
+      const tx = cam.x + i;
+      const ty = cam.y + j;
+      if(tx<0||ty<0||tx>=T_W||ty>=T_H) continue;
+      const t = tileAt(tx,ty);
+      if(t===Tile.AIR) continue;
+      // draw a pixel-art tile
+      const px = i*TILE, py = j*TILE;
+      drawTile(px,py,t);
+    }
+  }
+
+  // minimap
+  const scaleX = mapCan.width / T_W;
+  const scaleY = mapCan.height / T_H;
+  mctx.clearRect(0,0,mapCan.width,mapCan.height);
+  for(let y=0;y<T_H;y++){
+    for(let x=0;x<T_W;x++){
+      const t = tileAt(x,y);
+      if(t===Tile.AIR) continue;
+      mctx.fillStyle = tinyColorForTile(t);
+      mctx.fillRect(x*scaleX, y*scaleY, Math.ceil(scaleX), Math.ceil(scaleY));
+    }
+  }
+  // player dot
+  mctx.fillStyle = '#ff0000';
+  mctx.fillRect(player.x*scaleX-1, player.y*scaleY-1,2,2);
+}
+
+function tinyColorForTile(t){
+  if(t===Tile.GRASS) return '#3cb043';
+  if(t===Tile.DIRT) return '#8b5a2b';
+  if(t===Tile.STONE) return '#6b6b6b';
+  if(t===Tile.COAL) return '#111';
+  if(t===Tile.IRON) return '#cfcfe0';
+  if(t===Tile.TREE_TRUNK) return '#6b3e26';
+  if(t===Tile.LEAVES) return '#2e8b57';
+  if(t===Tile.CRAFTING) return '#a0522d';
+  if(t===Tile.ORE_GOLD) return '#ffd700';
+  return '#000';
+}
+
+function drawTile(px,py,t){
+  // basic pixel shading
+  if(t===Tile.GRASS){
+    ctx.fillStyle = tileColor[t]; ctx.fillRect(px,py,TILE,TILE);
+    // small top pixels
+    ctx.fillStyle = '#2f9b39'; ctx.fillRect(px+2,py+2,4,3);
+  } else if(t===Tile.DIRT){
+    ctx.fillStyle = tileColor[t]; ctx.fillRect(px,py,TILE,TILE);
+  } else if(t===Tile.STONE){
+    ctx.fillStyle = tileColor[t]; ctx.fillRect(px,py,TILE,TILE);
+    ctx.fillStyle = '#5a5a5a'; ctx.fillRect(px+3,py+3,3,3);
+  } else if(t===Tile.COAL){
+    ctx.fillStyle = tileColor[t]; ctx.fillRect(px,py,TILE,TILE);
+    ctx.fillStyle = '#111'; ctx.fillRect(px+3,py+4,2,2);
+  } else if(t===Tile.IRON){
+    ctx.fillStyle = tileColor[t]; ctx.fillRect(px,py,TILE,TILE);
+  } else if(t===Tile.ORE_GOLD){
+    ctx.fillStyle = tileColor[t]; ctx.fillRect(px,py,TILE,TILE);
+  } else if(t===Tile.TREE_TRUNK){
+    ctx.fillStyle = tileColor[t]; ctx.fillRect(px+4,py,8,TILE);
+  } else if(t===Tile.LEAVES){
+    ctx.fillStyle = tileColor[t]; ctx.fillRect(px,py,TILE,TILE);
+  } else if(t===Tile.CRAFTING){
+    ctx.fillStyle = tileColor[t]; ctx.fillRect(px,py,TILE,TILE);
+    ctx.fillStyle = '#c08f57'; ctx.fillRect(px+3,py+3,10,10);
+  } else {
+    ctx.fillStyle = '#000'; ctx.clearRect(px,py,TILE,TILE);
+  }
+}
+
+function renderEntities(){
+  for(const e of entities){
+    const sx = Math.floor((e.x - cam.x) * TILE);
+    const sy = Math.floor((e.y - cam.y) * TILE);
+    if(e.type==='sheep'){
+      // simple pixel sheep
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(sx-6, sy-6, 12, 8);
+      ctx.fillStyle = '#222'; ctx.fillRect(sx+2, sy-4,2,2); // eye
+    } else if(e.type==='zombie'){
+      ctx.fillStyle = '#2f8f2f';
+      ctx.fillRect(sx-6, sy-10, 12, 14);
+      ctx.fillStyle='#0a0a0a'; ctx.fillRect(sx-3,sy-6,2,2);
+    }
+  }
+}
+
+function renderPlayer(){
+  const sx = Math.floor((player.x - cam.x) * TILE);
+  const sy = Math.floor((player.y - cam.y) * TILE);
+  // draw pixel player
+  // body
+  ctx.fillStyle = '#2b6cff';
+  ctx.fillRect(sx-6, sy-14, 12, 14);
+  // head
+  ctx.fillStyle = '#ffd9b3';
+  ctx.fillRect(sx-5, sy-22, 10, 8);
+  // eye
+  ctx.fillStyle = '#000'; ctx.fillRect(sx-1, sy-20, 2,2);
+  // shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.2)'; ctx.fillRect(sx-10, sy-2, 20, 3);
+}
+
+function renderUI(){
+  // hotbar
+  const hb = document.getElementById('hotbar');
+  hb.innerHTML = '';
+  player.hotbar.forEach((it,idx)=>{
+    const s = document.createElement('div'); s.className='slot'; if(idx===player.selected) s.classList.add('selected');
+    s.onclick = ()=>player.selected = idx;
+    s.innerHTML = itemLabel(it);
+    hb.appendChild(s);
+  });
+  document.getElementById('health').innerText = Math.floor(player.health);
+  document.getElementById('hunger').innerText = Math.floor(player.hunger);
+}
+
+/* ----------------------
+   UI: Crafting panel
+   ---------------------- */
+const craftPanel = document.getElementById('craftPanel');
+const recipesDiv = document.getElementById('recipes');
+function openCrafting(isTable=false){
+  craftPanel.style.display = 'block';
+  recipesDiv.innerHTML = '';
+  const list = recipes.concat(isTable ? [ // additional 'table only' recipes
+    {id:'fancy_pick', to:'iron_pick', req:{iron:3, stick:2}}
+  ] : []);
+  for(const r of list){
+    const card = document.createElement('div');
+    card.style.background='rgba(255,255,255,0.03)';
+    card.style.padding='6px';
+    card.style.borderRadius='6px';
+    card.style.width='120px';
+    card.style.fontSize='12px';
+    let reqs = Object.entries(r.req||{}).map(([k,v])=>k+'x'+v).join(', ');
+    card.innerHTML = `<div style="font-weight:700">${r.to}</div><div style="font-size:11px">${reqs}</div><button>Craft</button>`;
+    card.querySelector('button').onclick = ()=>{
+      let ok=true;
+      for(const [k,v] of Object.entries(r.req||{})){
+        if((player.inv[k]||0) < v) ok=false;
+      }
+      if(!ok){ log('Missing ingredients'); return; }
+      for(const [k,v] of Object.entries(r.req||{})) take(k,v);
+      give(r.to,1);
+      log('Crafted: ' + r.to);
+    };
+    recipesDiv.appendChild(card);
+  }
+}
+document.getElementById('closeCraft').onclick = ()=>craftPanel.style.display='none';
+document.getElementById('saveBtn').onclick = saveGame;
+document.getElementById('resetBtn').onclick = ()=>{ if(confirm('Reset world?')) { localStorage.removeItem('tiny-survival-save'); location.reload(); } };
+window.addEventListener('keydown', e=>{ if(e.key.toLowerCase()==='e'){ // open crafting (hand)
+  openCrafting(false); } });
+
+function itemLabel(it){
+  if(!it) return '';
+  const counts = player.inv[it]||0;
+  return `<div style="text-align:center">${it}${counts?'<br><small>'+counts+'</small>':''}</div>`;
+}
+
+/* ----------------------
+   Save / Load
+   ---------------------- */
+function saveGame(){
+  const state = {
+    world, player, entities, dayStart, dayCount, lastSave:Date.now()
+  };
+  localStorage.setItem('tiny-survival-save', JSON.stringify(state));
+  log('Game saved');
+}
+function loadGame(){
+  const s = localStorage.getItem('tiny-survival-save');
+  if(!s) return false;
+  try{
+    const st = JSON.parse(s);
+    world = st.world;
+    Object.assign(player, st.player);
+    entities = st.entities || [];
+    dayStart = st.dayStart || dayStart;
+    dayCount = st.dayCount || dayCount;
+    log('Loaded save from ' + new Date(st.lastSave).toLocaleString());
+    return true;
+  }catch(e){ console.warn(e); return false; }
+}
+
+/* ----------------------
+   Helpers & bootstrap
+   ---------------------- */
+function distance(ax,ay,bx,by){ return Math.hypot(ax-bx, ay-by); }
+
+function seedFromName(n){
+  let h=2166136261;
+  for(let i=0;i<n.length;i++){ h = Math.imul(h ^ n.charCodeAt(i), 16777619); }
+  return h >>> 0;
+}
+
+// initial items
+give('stone', 6);
+give('wood', 6);
+give('coal', 2);
+player.hotbar = ['stone_pick','wood','dirt','torch','mutton'];
+
+if(!loadGame()){
+  generateWorld(seedFromName('github-demo'));
+  player.x = Math.floor(T_W/2) + 0.5;
+  // spawn a few sheep near player
+  spawnSheep(player.x+2, 5);
+  spawnSheep(player.x-3, 5);
+}
+
+// update hotbar based on inv if missing
+function refreshHotbarFromInv(){
+  for(let i=0;i<player.hotbar.length;i++){
+    if(!player.hotbar[i]) break;
+  }
+}
+refreshHotbarFromInv();
+requestAnimationFrame(gameTick);
+
+</script>
+</body>
+</html>
