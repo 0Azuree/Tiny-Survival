@@ -1,13 +1,13 @@
-html, body {
-  margin: 0;
-  padding: 0;
-  background: #87CEEB;
-  overflow: hidden;
+body {
+    margin: 0;
+    background: #202020;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
 }
 
-canvas {
-  display: block;
-  margin: auto;
-  background: #87CEEB;
-  image-rendering: pixelated;
+#gameCanvas {
+    border: 2px solid white;
+    image-rendering: pixelated;
 }
