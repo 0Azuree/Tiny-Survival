@@ -1,12 +1,733 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>2D Survival Game</title>
-    <link rel="stylesheet" href="style.css">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Infinite 2D Survival — Single File</title>
+<style>
+  html,body{height:100%;margin:0;background:linear-gradient(#87ceeb 0%, #17202A 100%);font-family:monospace;overflow:hidden}
+  #gameCanvas{display:block;margin:0 auto;background:#87ceeb; image-rendering: pixelated; border:2px solid #333}
+  #ui { position: fixed; left: 10px; top: 10px; color: #fff; text-shadow:0 0 4px #000; font-size:13px;}
+  #inventory { position: fixed; left:50%; transform:translateX(-50%); bottom: 8px; display:flex; gap:6px; }
+  .slot { width:36px; height:36px; background:rgba(0,0,0,0.6); border:2px solid #222; display:flex; align-items:center; justify-content:center; color:#fff; font-size:11px; position:relative; cursor:pointer; }
+  .slot.selected { border-color:gold; box-shadow:0 0 8px rgba(255,215,0,0.5) inset; }
+  .count { position:absolute; right:4px; bottom:2px; font-size:11px; color:#fff; text-shadow:0 0 2px #000; }
+  #craftingUI { position:fixed; right:10px; top:10px; width:220px; background:rgba(0,0,0,0.6); padding:8px; border-radius:6px; color:#fff; max-height:70vh; overflow:auto; box-shadow:0 0 10px #000; }
+  .recipe { padding:6px; background:rgba(255,255,255,0.02); margin-bottom:6px; border-radius:4px; cursor:pointer }
+  .recipe:hover { background:rgba(255,255,255,0.06) }
+  #messages { position:fixed; left:50%; transform:translateX(-50%); bottom:64px; color:#fff; text-shadow:0 0 6px #000; max-width:600px; text-align:center; pointer-events:none; }
+  #saveHint { position:fixed; left:10px; bottom:10px; color:#ddd; font-size:12px; text-shadow:0 0 3px #000 }
+</style>
 </head>
 <body>
 <canvas id="gameCanvas"></canvas>
-<script src="game.js"></script>
+
+<div id="ui">
+  <div><strong>Health:</strong> <span id="health">10</span> / 10 &nbsp; <strong>Hunger:</strong> <span id="hunger">10</span> / 10</div>
+  <div><strong>Day:</strong> <span id="day">1</span> &nbsp; <strong>Time:</strong> <span id="time">06:00</span></div>
+  <div style="margin-top:6px; font-size:12px">Controls: WASD/Arrows = move • Space = jump • Left click = mine/attack • Right click = place • 1-9 = hotbar • E = open crafting • S = save</div>
+</div>
+
+<div id="inventory"></div>
+<div id="craftingUI">
+  <div style="font-weight:bold; margin-bottom:6px">Crafting</div>
+  <div id="recipes"></div>
+  <div style="font-size:12px;opacity:0.85;margin-top:8px">Place or stand on a crafting table to unlock table recipes.</div>
+</div>
+
+<div id="messages"></div>
+<div id="saveHint">Auto-save every 20s — press S to save now</div>
+
+<script>
+/* ----------------------------
+   CONFIG
+   ---------------------------- */
+const TILE = 16; // pixels per tile
+const VIEW_TILES_W = 50; // visible tiles horizontally
+const VIEW_TILES_H = 30; // visible vertically
+const CANVAS_W = VIEW_TILES_W * TILE;
+const CANVAS_H = VIEW_TILES_H * TILE;
+const CHUNK_WIDTH = 16; // tiles per chunk
+const GRAVITY = 0.35;
+const JUMP_POWER = -7.8;
+const MAX_HEALTH = 10;
+const MAX_HUNGER = 10;
+const DAY_MS = 60 * 1000; // 60s per day
+const MAX_INTERACT_DISTANCE = 5; // tiles
+const AUTO_SAVE_INTERVAL = 20000; // ms
+
+// Tiles (IDs)
+const T_AIR=0, T_GRASS=1, T_DIRT=2, T_STONE=3, T_COAL=4, T_IRON=5, T_WOOD=6, T_LEAF=7, T_CRAFTING=8;
+
+// map tile -> color (basic)
+const TILE_COLOR = {
+  [T_AIR]: null,
+  [T_GRASS]: "#3BB143",
+  [T_DIRT]: "#8B4513",
+  [T_STONE]: "#7B7B7B",
+  [T_COAL]: "#222222",
+  [T_IRON]: "#D4AF37",
+  [T_WOOD]: "#A0522D",
+  [T_LEAF]: "#228B22",
+  [T_CRAFTING]: "#8B5A2B"
+};
+
+// convert tile -> inventory key
+const TILE_TO_KEY = {
+  [T_GRASS]:'grass',
+  [T_DIRT]:'dirt',
+  [T_STONE]:'stone',
+  [T_COAL]:'coal',
+  [T_IRON]:'iron',
+  [T_WOOD]:'wood',
+  [T_LEAF]:'leaves',
+  [T_CRAFTING]:'crafting_table'
+};
+const KEY_TO_TILE = {}; for(let k in TILE_TO_KEY) KEY_TO_TILE[TILE_TO_KEY[k]] = parseInt(k);
+
+// Recipes
+const RECIPES = {
+  'wood_plank': {wood:1},
+  'stick': {wood_plank:2},
+  'crafting_table': {wood_plank:4},
+  'torch': {stick:1, coal:1},
+  'sword': {stick:1, wood_plank:2}
+};
+
+// --- canvas ---
+const canvas = document.getElementById('gameCanvas');
+canvas.width = CANVAS_W; canvas.height = CANVAS_H;
+const ctx = canvas.getContext('2d');
+
+// UI elements
+const invDiv = document.getElementById('inventory');
+const recipesDiv = document.getElementById('recipes');
+const healthSpan = document.getElementById('health');
+const hungerSpan = document.getElementById('hunger');
+const daySpan = document.getElementById('day');
+const timeSpan = document.getElementById('time');
+const messagesDiv = document.getElementById('messages');
+
+// --- world storage: Map(chunkX -> chunkArray[localX][y]) ---
+let world = new Map();
+
+// simple deterministic noise
+let noiseSeed = Math.random()*10000;
+function pseudoNoise(x) { return fract(Math.sin(x*12.9898 + noiseSeed) * 43758.5453); }
+function fract(v){ return v - Math.floor(v); }
+
+// get or create chunk
+function makeChunk(cx) {
+  if(world.has(cx)) return world.get(cx);
+  const chunk = [];
+  for(let lx=0; lx<CHUNK_WIDTH; lx++){
+    chunk[lx] = new Array(VIEW_TILES_H).fill(T_AIR);
+    const worldX = cx * CHUNK_WIDTH + lx;
+    // heightmap base
+    let base = Math.floor(12 + Math.sin(worldX/10)*6 + pseudoNoise(worldX/7)*6);
+    base = clamp(base, 6, VIEW_TILES_H-6);
+    for(let y=0;y<VIEW_TILES_H;y++){
+      if(y < base) chunk[lx][y] = T_AIR;
+      else if(y === base) chunk[lx][y] = T_GRASS;
+      else if(y > base && y < base+3) chunk[lx][y] = T_DIRT;
+      else {
+        const r = Math.random();
+        if(r < 0.02) chunk[lx][y] = T_COAL;
+        else if(r < 0.035) chunk[lx][y] = T_IRON;
+        else chunk[lx][y] = T_STONE;
+      }
+    }
+    // trees occasionally
+    if(Math.random() < 0.12 && base > 4 && base < VIEW_TILES_H-6) {
+      // trunk
+      for(let h=0;h<4;h++){
+        if(base - h >= 0) chunk[lx][base - h] = T_WOOD;
+      }
+      // leaves
+      for(let dx=-2; dx<=2; dx++){
+        for(let dy=-2; dy<=0; dy++){
+          const ax = lx + dx;
+          const ay = base - 4 + dy;
+          if(ax>=0 && ax<CHUNK_WIDTH && ay>=0 && ay<VIEW_TILES_H && Math.abs(dx)+Math.abs(dy) < 4){
+            if(chunk[ax][ay] === T_AIR) chunk[ax][ay] = T_LEAF;
+          }
+        }
+      }
+    }
+  }
+  world.set(cx, chunk);
+  return chunk;
+}
+function getTile(worldX, worldY){
+  const chunkX = Math.floor(worldX / CHUNK_WIDTH);
+  const localX = worldX - chunkX * CHUNK_WIDTH;
+  const chunk = makeChunk(chunkX);
+  if(localX < 0 || localX >= CHUNK_WIDTH || worldY < 0 || worldY >= VIEW_TILES_H) return T_AIR;
+  return chunk[localX][worldY];
+}
+function setTile(worldX, worldY, tile){
+  const chunkX = Math.floor(worldX / CHUNK_WIDTH);
+  const localX = worldX - chunkX * CHUNK_WIDTH;
+  const chunk = makeChunk(chunkX);
+  if(localX < 0 || localX >= CHUNK_WIDTH || worldY < 0 || worldY >= VIEW_TILES_H) return false;
+  chunk[localX][worldY] = tile;
+  return true;
+}
+
+function clamp(a,b,c){ return Math.max(b, Math.min(c,a)); }
+
+// --- player ---
+let player = {
+  x: 8, y: 6, width: 0.9, height: 1.8,
+  vx:0, vy:0, onGround:false,
+  health: MAX_HEALTH, hunger: MAX_HUNGER,
+  inventory: { dirt: 6, wood: 4, coal: 0, iron:0, crafting_table:0, wood_plank:0, stick:0, torch:0, sword:0 },
+  hotbarOrder: ['dirt','wood','coal','iron','crafting_table','wood_plank','stick','torch','sword'],
+  selected: 0
+};
+
+// --- entities ---
+let entities = []; // {type:'sheep'|'zombie', x,y, vx, vy, health, lastAction}
+function spawnSheep(x,y){ entities.push({type:'sheep',x,y,vx:(Math.random()-0.5)*0.6,vy:0,health:6,lastAction:0})}
+function spawnZombie(x,y){ entities.push({type:'zombie',x,y,vx:0,vy:0,health:12,lastAction:0})}
+
+// --- camera & view ---
+function camera() {
+  return {
+    x: player.x + player.width/2 - VIEW_TILES_W/2,
+    y: player.y + player.height/2 - VIEW_TILES_H/2
+  };
+}
+
+// --- input ---
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true;
+  if(e.key >= '1' && e.key <= '9'){
+    const s = parseInt(e.key)-1; if(s < player.hotbarOrder.length){ player.selected = s; updateHotbarUI(); }
+  }
+  if(e.key.toLowerCase() === 'e') toggleCraftingUI();
+  if(e.key.toLowerCase() === 's') { saveGame(); showMessage("Saved"); }
+});
+window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+
+// mouse
+let mouse = {x:0,y:0,left:false,right:false};
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+});
+canvas.addEventListener('mousedown', e => {
+  if(e.button === 0) mouse.left = true;
+  if(e.button === 2) mouse.right = true;
+});
+canvas.addEventListener('mouseup', e => {
+  if(e.button === 0) mouse.left = false;
+  if(e.button === 2) mouse.right = false;
+});
+canvas.oncontextmenu = e => e.preventDefault();
+
+// --- UI helpers ---
+function updateHotbarUI(){
+  invDiv.innerHTML = '';
+  player.hotbarOrder.forEach((key, idx)=>{
+    const slot = document.createElement('div');
+    slot.className = 'slot' + (player.selected === idx ? ' selected' : '');
+    slot.onclick = ()=>{ player.selected = idx; updateHotbarUI(); };
+    slot.title = key;
+    const label = document.createElement('div');
+    label.style.pointerEvents='none';
+    label.innerText = key.split('_').join(' ');
+    slot.appendChild(label);
+    const cnt = document.createElement('div'); cnt.className='count'; cnt.innerText = (player.inventory[key]||0) > 0 ? (player.inventory[key]||0) : '';
+    slot.appendChild(cnt);
+    invDiv.appendChild(slot);
+  });
+}
+
+function populateRecipes(){
+  recipesDiv.innerHTML = '';
+  for(const out in RECIPES){
+    const req = RECIPES[out];
+    const div = document.createElement('div');
+    div.className='recipe';
+    const reqList = Object.entries(req).map(([k,v])=> `${k}x${v}`).join(', ');
+    div.innerHTML = `<div style="font-weight:bold">${out.replace('_',' ')}</div><div style="font-size:12px">${reqList}</div>`;
+    div.onclick = ()=>attemptCraft(out);
+    recipesDiv.appendChild(div);
+  }
+}
+
+function attemptCraft(out){
+  const req = RECIPES[out];
+  // Check if crafting table required (we won't require it in this basic set; but we do check if player stands on craft tile for table-only recipes)
+  let ok = true;
+  for(const k in req) if((player.inventory[k]||0) < req[k]) ok = false;
+  if(!ok){ showMessage('Missing ingredients'); return; }
+  for(const k in req) player.inventory[k] -= req[k];
+  player.inventory[out] = (player.inventory[out] || 0) + 1;
+  showMessage('Crafted ' + out.replace('_',' '));
+  updateHotbarUI();
+}
+
+// messages
+let messageQueue = [];
+function showMessage(text, ms=3000){
+  const t = {text, t0: performance.now(), ms};
+  messageQueue.push(t);
+  renderMessages();
+}
+function renderMessages(){
+  messagesDiv.innerHTML = '';
+  const now = performance.now();
+  messageQueue = messageQueue.filter(m => now - m.t0 < m.ms);
+  messageQueue.forEach((m, i)=>{
+    const d = document.createElement('div');
+    d.style.opacity = 1 - ((now - m.t0)/m.ms);
+    d.style.marginTop = i ? '6px' : '0';
+    d.innerText = m.text;
+    messagesDiv.appendChild(d);
+  });
+}
+
+// --- mining & placing ---
+let lastMineTime = 0;
+const MINE_COOLDOWN = 220; // ms
+
+function worldCoordsFromMouse(){
+  const cam = camera();
+  const wx = Math.floor(cam.x + (mouse.x / TILE));
+  const wy = Math.floor(cam.y + (mouse.y / TILE));
+  return {wx, wy};
+}
+
+function mineAt(wx, wy){
+  const dist = Math.hypot((player.x+player.width/2)- (wx+0.5), (player.y+player.height/2)-(wy+0.5));
+  if(dist > MAX_INTERACT_DISTANCE) { showMessage('Too far'); return; }
+  const tile = getTile(wx, wy);
+  if(tile === T_AIR) return;
+  // extract drops
+  const key = TILE_TO_KEY[tile];
+  if(key){
+    player.inventory[key] = (player.inventory[key]||0) + 1;
+  }
+  setTile(wx, wy, T_AIR);
+  showMessage('Mined ' + (key || 'block'));
+  updateHotbarUI();
+}
+
+function placeAt(wx, wy){
+  const slotKey = player.hotbarOrder[player.selected];
+  if(!slotKey) return;
+  const tileID = KEY_TO_TILE[slotKey];
+  if(tileID === undefined) { showMessage('Cannot place ' + slotKey); return; }
+  const dist = Math.hypot((player.x+player.width/2)- (wx+0.5), (player.y+player.height/2)-(wy+0.5));
+  if(dist > MAX_INTERACT_DISTANCE) { showMessage('Too far'); return; }
+  const target = getTile(wx, wy);
+  if(target !== T_AIR) { showMessage('Space occupied'); return; }
+  if((player.inventory[slotKey]||0) <= 0) { showMessage('No ' + slotKey); return; }
+  const ok = setTile(wx, wy, tileID);
+  if(ok){ player.inventory[slotKey]--; showMessage('Placed ' + slotKey); updateHotbarUI(); }
+}
+
+// --- physics & collision ---
+function rectsOverlap(ax,ay,aw,ah, bx,by,bw,bh){
+  return !(bx >= ax+aw || bx+bw <= ax || by >= ay+ah || by+bh <= ay);
+}
+
+function resolvePlayerCollision(){
+  player.onGround = false;
+  // check tiles near player
+  const minX = Math.floor(player.x - 1);
+  const maxX = Math.floor(player.x + player.width + 1);
+  const minY = Math.floor(player.y - 1);
+  const maxY = Math.floor(player.y + player.height + 1);
+  for(let tx=minX; tx<=maxX; tx++){
+    for(let ty=minY; ty<=maxY; ty++){
+      const tile = getTile(tx, ty);
+      if(tile !== T_AIR && tile !== T_LEAF){
+        if(rectsOverlap(player.x, player.y, player.width, player.height, tx, ty, 1,1)){
+          // Determine minimal penetration direction
+          // previous position approx:
+          const pxPrev = player.x - player.vx;
+          const pyPrev = player.y - player.vy;
+          // if coming from above (falling)
+          if(pyPrev + player.height <= ty){
+            player.y = ty - player.height;
+            player.vy = 0;
+            player.onGround = true;
+          } else if(pyPrev >= ty + 1){
+            // hit from below
+            player.y = ty + 1;
+            player.vy = 0;
+          } else if(pxPrev + player.width <= tx){
+            player.x = tx - player.width;
+            player.vx = 0;
+          } else if(pxPrev >= tx + 1){
+            player.x = tx + 1;
+            player.vx = 0;
+          }
+        }
+      }
+    }
+  }
+}
+
+// --- entities update/render ---
+function updateEntities(dt, isNight){
+  for(let i = entities.length-1; i>=0; i--){
+    const e = entities[i];
+    e.lastAction = (e.lastAction || 0) + dt;
+    // gravity
+    e.vy += GRAVITY * (dt/16);
+    e.y += e.vy * (dt/16);
+    e.x += e.vx * (dt/16);
+    // ground check
+    const foot = Math.floor(e.y + 1);
+    if(getTile(Math.floor(e.x), foot) !== T_AIR){
+      e.y = foot - 1.01;
+      e.vy = 0;
+    }
+    if(e.type === 'sheep'){
+      if(Math.random() < 0.005) e.vx = (Math.random()-0.5) * 0.4;
+      if(e.lastAction > 2000) { e.lastAction = 0; e.vx *= 0.9; }
+      // occasional wool drop
+      if(Math.random() < 0.0008) player.inventory['leaves'] = (player.inventory['leaves']||0) + 0; // placeholder
+    } else if(e.type === 'zombie'){
+      // at night chase player
+      const dx = player.x - e.x;
+      e.vx = Math.sign(dx) * 0.04;
+      // attack if close
+      if(Math.hypot(e.x - player.x, e.y - player.y) < 1.2 && e.lastAction > 1000){
+        e.lastAction = 0;
+        player.health -= 1;
+        if(player.health <= 0) {
+          player.health = 0;
+          showMessage('You died. Press Save then refresh to respawn.');
+        } else showMessage('Hit by zombie! Health: ' + player.health);
+      }
+    }
+    // remove if off world vertical
+    if(e.y > VIEW_TILES_H + 10) entities.splice(i,1);
+  }
+}
+
+function spawnEntitiesNearPlayer(isNight){
+  // sheep spawn in day
+  if(Math.random() < 0.01 && !isNight){
+    const px = Math.floor(player.x + (Math.random()-0.5) * 30);
+    let py = 0;
+    for(let y=0;y<VIEW_TILES_H;y++){ if(getTile(px,y) !== T_AIR){ py = y-1; break; } }
+    if(py > 2) spawnSheep(px+Math.random(), py);
+  }
+  // zombie spawn at night
+  if(isNight && Math.random() < 0.015){
+    const px = Math.floor(player.x + (Math.random()-0.5) * 40);
+    let py = 0;
+    for(let y=0;y<VIEW_TILES_H;y++){ if(getTile(px,y) !== T_AIR){ py = y-1; break; } }
+    if(py > 2) spawnZombie(px+Math.random(), py);
+  }
+}
+
+// --- rendering ---
+function drawWorld(){
+  const cam = camera();
+  // background gradient
+  const grd = ctx.createLinearGradient(0,0,0,CANVAS_H);
+  grd.addColorStop(0, '#87ceeb'); grd.addColorStop(1, '#4a6b44');
+  ctx.fillStyle = grd; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+
+  // draw tiles in viewport
+  for(let vy=0; vy<VIEW_TILES_H; vy++){
+    for(let vx=0; vx<VIEW_TILES_W; vx++){
+      const worldX = Math.floor(cam.x) + vx;
+      const worldY = Math.floor(cam.y) + vy;
+      const tile = getTile(worldX, worldY);
+      if(tile === T_AIR) continue;
+      const sx = vx * TILE, sy = vy * TILE;
+      // base block
+      ctx.fillStyle = TILE_COLOR[tile] || '#000';
+      ctx.fillRect(sx, sy, TILE, TILE);
+      // details
+      switch(tile){
+        case T_GRASS:
+          ctx.fillStyle = '#2a8c27'; ctx.fillRect(sx+2, sy+TILE-5, TILE-4, 3); break;
+        case T_LEAF:
+          ctx.fillStyle = '#196019'; ctx.fillRect(sx+3, sy+3, TILE-6, TILE-6); break;
+        case T_WOOD:
+          ctx.fillStyle = '#6b3e26'; ctx.fillRect(sx+3, sy+3, TILE-6, TILE-6); break;
+        case T_COAL:
+          ctx.fillStyle = '#111'; ctx.fillRect(sx+4, sy+4, TILE-8, TILE-8); break;
+        case T_IRON:
+          ctx.fillStyle = '#cfa50b'; ctx.fillRect(sx+4, sy+4, TILE-8, TILE-8); break;
+        case T_CRAFTING:
+          ctx.fillStyle = '#6a3f1f'; ctx.fillRect(sx+2, sy+2, TILE-4, TILE-4); ctx.fillStyle='#c89a6c'; ctx.fillRect(sx+4, sy+4, TILE-8, TILE-8); break;
+      }
+    }
+  }
+}
+
+function drawEntities(){
+  const cam = camera();
+  entities.forEach(e=>{
+    const sx = (e.x - cam.x) * TILE;
+    const sy = (e.y - cam.y) * TILE;
+    if(e.type === 'sheep'){
+      // white block with eye
+      ctx.fillStyle = '#fff'; ctx.fillRect(sx-6, sy-6, 12, 8);
+      ctx.fillStyle = '#222'; ctx.fillRect(sx+2, sy-4, 2, 2);
+    } else if(e.type === 'zombie'){
+      ctx.fillStyle = '#2f8f2f'; ctx.fillRect(sx-6, sy-10, 12, 14);
+      ctx.fillStyle = '#000'; ctx.fillRect(sx-3, sy-6, 2,2);
+    }
+  });
+}
+
+function drawPlayer(){
+  const cam = camera();
+  const sx = (player.x - cam.x) * TILE;
+  const sy = (player.y - cam.y) * TILE;
+  // shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(sx-8, sy+TILE-6, 24, 4);
+  // body
+  ctx.fillStyle = '#2b6cff'; ctx.fillRect(sx-6, sy-14, 12, 14);
+  // head
+  ctx.fillStyle = '#ffd9b3'; ctx.fillRect(sx-5, sy-22, 10, 8);
+  // eye
+  ctx.fillStyle = '#000'; ctx.fillRect(sx-1, sy-20, 2, 2);
+}
+
+// -- lighting / day-night overlay --
+function drawLighting(timeOfDay){ // timeOfDay 0..1 (0 midnight, 0.5 midday)
+  // convert to darkness (0 night, 1 day)
+  const dayLight = Math.max(0.15, Math.cos(timeOfDay * 2 * Math.PI) * 0.5 + 0.5);
+  const alpha = 1 - dayLight; // darkness alpha
+  ctx.fillStyle = `rgba(0,0,32,${alpha*0.6})`; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+}
+
+// --- game loop & updates ---
+let lastTime = performance.now();
+let startTime = performance.now();
+let dayCount = 1;
+let lastAutoSave = performance.now();
+
+function gameLoop(t){
+  const dt = Math.min(50, t - lastTime);
+  lastTime = t;
+
+  // day/night progression
+  let elapsed = (t - startTime) % DAY_MS;
+  const timeOfDay = elapsed / DAY_MS; // 0..1
+  // determine hour
+  const hour = Math.floor(timeOfDay * 24);
+  const minute = Math.floor(((timeOfDay*24) - hour) * 60);
+  daySpan.innerText = dayCount;
+  timeSpan.innerText = String(hour).padStart(2,'0') + ':' + String(minute).padStart(2,'0');
+
+  const isNight = (hour < 6 || hour >= 18);
+
+  // Input & movement
+  const speed = (keys['shift'] ? 0.22 : 0.12) * (dt/16);
+  if(keys['a'] || keys['arrowleft']) player.vx -= speed;
+  if(keys['d'] || keys['arrowright']) player.vx += speed;
+  // friction
+  player.vx *= 0.92;
+  // jump
+  if((keys['w'] || keys['arrowup'] || keys[' ']) && player.onGround){
+    player.vy = JUMP_POWER;
+    player.onGround = false;
+  }
+  // gravity
+  player.vy += GRAVITY * (dt/16);
+
+  // integrate
+  player.x += player.vx * (dt/16);
+  player.y += player.vy * (dt/16);
+
+  // resolve collisions
+  resolvePlayerCollision();
+
+  // Entities
+  updateEntities(dt, isNight);
+  spawnEntitiesNearPlayer(isNight);
+
+  // Mining / placing interactions
+  if(mouse.left && t - lastMineTime > MINE_COOLDOWN){
+    lastMineTime = t;
+    const wc = worldCoordsFromMouse();
+    mineAt(wc.wx, wc.wy);
+  }
+  if(mouse.right && t - lastMineTime > MINE_COOLDOWN){
+    lastMineTime = t;
+    const wc = worldCoordsFromMouse();
+    placeAt(wc.wx, wc.wy);
+  }
+
+  // hunger depletion
+  player.hunger -= 0.0008 * dt;
+  if(player.hunger < 0) player.hunger = 0;
+  if(player.hunger === 0){
+    player.health -= 0.003 * dt;
+    if(player.health < 0) player.health = 0;
+  }
+
+  // periodic autosave
+  if(t - lastAutoSave > AUTO_SAVE_INTERVAL) {
+    lastAutoSave = t; saveGame(); // silent auto
+  }
+
+  // draw
+  drawWorld();
+  drawEntities();
+  drawPlayer();
+  drawLighting(timeOfDay);
+
+  // update UI
+  healthSpan.innerText = Math.max(0, Math.floor(player.health));
+  hungerSpan.innerText = Math.max(0, Math.floor(player.hunger));
+
+  // messages rendering
+  renderMessages();
+
+  // day rollover
+  if(t - startTime >= DAY_MS){
+    startTime = t;
+    dayCount++;
+    showMessage('Day ' + dayCount);
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// helpers for mouse world coords
+function worldCoordsFromMouse(){
+  const cam = camera();
+  const wx = Math.floor(cam.x + (mouse.x / TILE));
+  const wy = Math.floor(cam.y + (mouse.y / TILE));
+  return {wx, wy};
+}
+
+// --- tile interactions implemented earlier placed here for order ---
+let lastMineTime = 0;
+const MINE_COOLDOWN = 220;
+
+function mineAt(wx, wy){
+  const dist = Math.hypot((player.x+player.width/2)-(wx+0.5), (player.y+player.height/2)-(wy+0.5));
+  if(dist > MAX_INTERACT_DISTANCE){ showMessage('Too far'); return; }
+  const tile = getTile(wx, wy);
+  if(tile === T_AIR) return;
+  const key = TILE_TO_KEY[tile];
+  if(key){
+    player.inventory[key] = (player.inventory[key]||0) + 1;
+  } else {
+    // unknown tile
+  }
+  setTile(wx, wy, T_AIR);
+  showMessage('Mined ' + (key || 'block'));
+  updateHotbarUI();
+}
+
+function placeAt(wx, wy){
+  const slotKey = player.hotbarOrder[player.selected];
+  if(!slotKey) return;
+  const tileID = KEY_TO_TILE[slotKey];
+  if(tileID === undefined){ showMessage('Cannot place ' + slotKey); return; }
+  const dist = Math.hypot((player.x+player.width/2)-(wx+0.5), (player.y+player.height/2)-(wy+0.5));
+  if(dist > MAX_INTERACT_DISTANCE){ showMessage('Too far'); return; }
+  const target = getTile(wx, wy);
+  if(target !== T_AIR){ showMessage('Space occupied'); return; }
+  if((player.inventory[slotKey]||0) <= 0){ showMessage('No ' + slotKey); return; }
+  const ok = setTile(wx, wy, tileID);
+  if(ok){ player.inventory[slotKey]--; showMessage('Placed ' + slotKey); updateHotbarUI(); }
+}
+
+// --- save/load ---
+function saveGame(){
+  try {
+    const serial = {
+      startTime: startTime,
+      dayCount: dayCount,
+      player: player,
+      entities: entities,
+      worldChunks: [...world.entries()]
+    };
+    localStorage.setItem('infinite2d_save', JSON.stringify(serial));
+    // showMessage('Game saved');
+  } catch(e){ console.error('save failed', e); showMessage('Save failed'); }
+}
+function loadGame(){
+  try {
+    const s = localStorage.getItem('infinite2d_save');
+    if(!s) { showMessage('New world generated'); return; }
+    const data = JSON.parse(s);
+    if(data.startTime) startTime = data.startTime;
+    if(data.dayCount) dayCount = data.dayCount;
+    if(data.player) {
+      // careful assign inventory and simple fields, but do not overwrite methods
+      player.x = data.player.x || player.x;
+      player.y = data.player.y || player.y;
+      player.vx = 0; player.vy = 0;
+      player.health = data.player.health || player.health;
+      player.hunger = data.player.hunger || player.hunger;
+      player.inventory = data.player.inventory || player.inventory;
+      player.selected = data.player.selected || player.selected;
+      player.hotbarOrder = data.player.hotbarOrder || player.hotbarOrder;
+    }
+    if(data.entities) entities = data.entities;
+    if(data.worldChunks){
+      world = new Map(data.worldChunks);
+    }
+    showMessage('Game loaded');
+  } catch(e){ console.warn('load error', e); showMessage('Load failed'); }
+}
+
+// --- UI wiring ---
+function updateHotbarUI(){
+  invDiv.innerHTML = '';
+  player.hotbarOrder.forEach((k,i)=>{
+    const slot = document.createElement('div'); slot.className = 'slot' + (player.selected === i ? ' selected' : '');
+    slot.onclick = ()=>{ player.selected = i; updateHotbarUI(); };
+    slot.innerText = k.split('_').join(' ').slice(0,8);
+    const cnt = document.createElement('div'); cnt.className='count'; cnt.innerText = (player.inventory[k]||0) > 0 ? player.inventory[k] : '';
+    slot.appendChild(cnt);
+    invDiv.appendChild(slot);
+  });
+}
+function toggleCraftingUI(){ const el = document.getElementById('craftingUI'); el.style.display = (el.style.display === 'none') ? 'block' : 'none'; }
+function populateCrafting(){ recipesDiv.innerHTML = ''; for(const out in RECIPES){ const r = RECIPES[out]; const div = document.createElement('div'); div.className='recipe'; const reqList = Object.entries(r).map(([k,v])=>k+ 'x'+v).join(', '); div.innerHTML = `<div style="font-weight:700">${out.replace('_',' ')}</div><div style="font-size:12px">${reqList}</div>`; div.onclick = ()=>{ craft(out) }; recipesDiv.appendChild(div); } }
+
+function craft(out){
+  const req = RECIPES[out];
+  let ok = true;
+  for(const k in req) if((player.inventory[k]||0) < req[k]) ok = false;
+  if(!ok){ showMessage('Missing ingredients'); return; }
+  for(const k in req) player.inventory[k] -= req[k];
+  player.inventory[out] = (player.inventory[out]||0) + 1;
+  showMessage('Crafted ' + out.replace('_',' '));
+  updateHotbarUI();
+}
+
+// messages rendering called from game loop already via renderMessages()
+
+// --- initialization ---
+populateRecipes();
+updateHotbarUI();
+loadGame();
+showMessage('Controls: WASD/Arrows, Space, Mouse: Left mine / Right place, 1-9 hotbar, E crafting, S save');
+
+// start some nearby animals
+spawnSheep(player.x+3, 6);
+spawnSheep(player.x-4, 6);
+
+// begin loop
+requestAnimationFrame(gameLoop);
+
+// Expose small helpers in console for testing
+window.saveGame = saveGame;
+window.loadGame = loadGame;
+window.playerObj = player;
+window.worldMap = world;
+
+</script>
 </body>
 </html>
